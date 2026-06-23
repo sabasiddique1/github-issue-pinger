@@ -1,9 +1,9 @@
 {
-  "github_username": "username",
+  "github_username": "Mahnoor-Zaffar",
   "include_prs": false,
   "max_issues_per_repo": 10,
-  "max_repos": 50,
-  "days_back": 7,
+    "max_repos": 20,
+    "days_back": 3,
   "results_per_page": 100,
   "max_pages_per_repo": 3,
   "connect_timeout_seconds": 5,
@@ -11,6 +11,7 @@
   "request_retries": 3,
   "retry_backoff_seconds": 0.5,
   "max_runtime_seconds": 50,
+  "max_concurrent_repos": 8,
   "use_parent_issues": true,
   "max_display": 200,
   "refresh_interval_minutes": 60

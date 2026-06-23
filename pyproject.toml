@@ -1,0 +1,21 @@
+[project]
+name = "github-issue-pinger"
+version = "1.0.0"
+description = "Monitor recent GitHub issues across forked repositories"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "requests>=2.31.0,<3",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
+include = ["github_issue_pinger.py", "github-issues.1h.py"]

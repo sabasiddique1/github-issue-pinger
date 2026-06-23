@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
-from typing import Any, Dict, List, Optional
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -21,14 +23,48 @@ STATE_PATH = os.getenv(
 HTML_REPORT_PATH = os.getenv(
     "GITHUB_ISSUE_HTML", os.path.join(BASE_DIR, "github_issues_report.html")
 )
+DOTENV_PATH = os.getenv("GITHUB_ISSUE_DOTENV", os.path.join(BASE_DIR, ".env"))
+
+UNAUTH_MAX_CONCURRENT_REPOS = 2
+UNAUTH_RATE_LIMIT_THRESHOLD = 8
+
+
+class IssueItem(TypedDict, total=False):
+    repo: str
+    source_repo: str
+    number: int
+    title: str
+    url: str
+    created_at: str
+    labels: List[Dict[str, str]]
+    is_new: bool
+
+
+class FetchOutput(TypedDict, total=False):
+    total_recent: int
+    total_new: int
+    per_repo_counts: Dict[str, int]
+    days_back: int
+    max_display: int
+    html_report_path: str
+    items: List[IssueItem]
+    processed_repos: int
+    fetched_fork_repos: int
+    partial: bool
+    generated_at: str
+    warning: str
+    repo_errors: List[str]
+    authenticated: bool
+    error: str
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "github_username": "${GITHUB_USERNAME}",
     "github_token": "",
     "include_prs": False,
     "max_issues_per_repo": 10,
-    "max_repos": 50,
-    "days_back": 7,
+    "max_repos": 20,
+    "days_back": 3,
     "results_per_page": 100,
     "max_pages_per_repo": 3,
     "connect_timeout_seconds": 5,
@@ -36,10 +72,96 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "request_retries": 3,
     "retry_backoff_seconds": 0.5,
     "max_runtime_seconds": 50,
+    "max_concurrent_repos": 8,
     "use_parent_issues": True,
     "max_display": 200,
     "refresh_interval_minutes": 60,
 }
+
+
+class RateLimitGuard:
+    """Tracks GitHub rate-limit headers across concurrent workers."""
+
+    def __init__(self, threshold: int = 100) -> None:
+        self._lock = threading.Lock()
+        self._remaining: Optional[int] = None
+        self.threshold = threshold
+
+    def note(self, response: requests.Response) -> None:
+        raw = response.headers.get("X-RateLimit-Remaining")
+        if raw is None:
+            return
+        try:
+            remaining = int(raw)
+        except ValueError:
+            return
+        with self._lock:
+            self._remaining = remaining
+
+    def pause_if_low(self, threshold: int = 100) -> None:
+        with self._lock:
+            remaining = self._remaining
+        if remaining is not None and remaining < threshold:
+            time.sleep(0.5 if threshold <= 10 else 0.25)
+
+
+def load_dotenv(path: str) -> None:
+    """Load KEY=VALUE pairs from a .env file without overwriting existing env vars."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+    except FileNotFoundError:
+        return
+
+
+def resolve_github_token(cfg: Dict[str, Any]) -> Optional[str]:
+    token = os.getenv("GITHUB_TOKEN") or cfg.get("github_token") or None
+    if not token:
+        return None
+    token = str(token).strip()
+    return token or None
+
+
+def effective_concurrency(configured: int, authenticated: bool) -> int:
+    configured = max(1, int(configured))
+    if authenticated:
+        return configured
+    return min(configured, UNAUTH_MAX_CONCURRENT_REPOS)
+
+
+def rate_limit_threshold(authenticated: bool) -> int:
+    return 100 if authenticated else UNAUTH_RATE_LIMIT_THRESHOLD
+
+
+def make_thread_local_session_factory(
+    token: Optional[str],
+    request_retries: int,
+    retry_backoff_seconds: float,
+    pool_size: int,
+) -> Callable[[], requests.Session]:
+    local = threading.local()
+
+    def factory() -> requests.Session:
+        session = getattr(local, "session", None)
+        if session is None:
+            session = build_github_session(
+                token, request_retries, retry_backoff_seconds, pool_size=pool_size
+            )
+            local.session = session
+        return session
+
+    return factory
 
 
 def ensure_parent_dir(path: str) -> None:
@@ -78,6 +200,7 @@ def build_github_session(
     token: Optional[str],
     request_retries: int,
     retry_backoff_seconds: float,
+    pool_size: int = 10,
 ) -> requests.Session:
     retry_count = max(0, int(request_retries))
     retry = Retry(
@@ -91,7 +214,8 @@ def build_github_session(
         respect_retry_after_header=True,
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    pool = max(4, int(pool_size))
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=pool, pool_maxsize=pool)
     session = requests.Session()
     session.headers.update(
         {
@@ -151,10 +275,11 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
             f'<span class="label" style="background:#{lb.get("color","ededed")};color:{_label_text_color(lb.get("color","ededed"))}">{lb.get("name","")}</span>'
             for lb in labels
         ) or '<span class="label-empty">—</span>'
+        new_badge = '<span class="new-badge">NEW</span> ' if item.get("is_new") else ""
         rows.append(
-            f'<tr><td class="date">{date_str}</td>'
+            f'<tr class="{"is-new" if item.get("is_new") else ""}"><td class="date">{date_str}</td>'
             f'<td class="repo"><a href="https://github.com/{repo}" target="_blank">{repo_short}</a></td>'
-            f'<td class="title"><a href="{url}" target="_blank">{title}</a></td>'
+            f'<td class="title">{new_badge}<a href="{url}" target="_blank">{title}</a></td>'
             f'<td class="labels">{label_spans}</td></tr>'
         )
 
@@ -222,6 +347,19 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
       margin-bottom: 2px;
     }}
     .label-empty {{ color: #8b949e; font-size: 0.9rem; }}
+    tr.is-new {{ background: rgba(56, 139, 253, 0.08); }}
+    .new-badge {{
+      display: inline-block;
+      margin-right: 6px;
+      padding: 1px 6px;
+      border-radius: 10px;
+      background: #238636;
+      color: #ffffff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      vertical-align: middle;
+    }}
   </style>
 </head>
 <body>
@@ -256,7 +394,10 @@ def gh_get(
     connect_timeout_seconds: int,
     request_timeout_seconds: int,
     deadline_monotonic: Optional[float] = None,
+    rate_limit_guard: Optional[RateLimitGuard] = None,
 ) -> Any:
+    if rate_limit_guard is not None:
+        rate_limit_guard.pause_if_low(rate_limit_guard.threshold)
     connect_timeout = max(1.0, float(connect_timeout_seconds))
     read_timeout = _next_request_timeout(request_timeout_seconds, deadline_monotonic)
     try:
@@ -268,6 +409,8 @@ def gh_get(
         ) from exc
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(f"GitHub API request failed for {url}: {exc}") from exc
+    if rate_limit_guard is not None:
+        rate_limit_guard.note(r)
     if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
         reset = r.headers.get("X-RateLimit-Reset")
         reset_note = f" (resets at {reset})" if reset else ""
@@ -290,6 +433,7 @@ def list_forked_repos(
     connect_timeout_seconds: int,
     request_timeout_seconds: int,
     deadline_monotonic: Optional[float],
+    rate_limit_guard: Optional[RateLimitGuard] = None,
 ) -> List[Dict[str, Any]]:
     repos: List[Dict[str, Any]] = []
     page = 1
@@ -307,6 +451,7 @@ def list_forked_repos(
                 connect_timeout_seconds,
                 request_timeout_seconds,
                 deadline_monotonic,
+                rate_limit_guard,
             )
         except TimeoutError:
             break
@@ -321,6 +466,19 @@ def list_forked_repos(
     return repos
 
 
+def resolve_issue_repo_from_fork(
+    fork_repo: Dict[str, Any],
+    fork_full_name: str,
+    use_parent_issues: bool,
+) -> str:
+    if not use_parent_issues:
+        return fork_full_name
+    parent = fork_repo.get("parent") or fork_repo.get("source")
+    if parent and parent.get("full_name"):
+        return parent["full_name"]
+    return fork_full_name
+
+
 def resolve_issue_repo(
     session: requests.Session,
     fork_full_name: str,
@@ -328,6 +486,7 @@ def resolve_issue_repo(
     connect_timeout_seconds: int,
     request_timeout_seconds: int,
     deadline_monotonic: Optional[float],
+    rate_limit_guard: Optional[RateLimitGuard] = None,
 ) -> str:
     if not use_parent_issues:
         return fork_full_name
@@ -339,6 +498,7 @@ def resolve_issue_repo(
             connect_timeout_seconds,
             request_timeout_seconds,
             deadline_monotonic,
+            rate_limit_guard,
         )
     except TimeoutError:
         return fork_full_name
@@ -346,31 +506,6 @@ def resolve_issue_repo(
     if parent and parent.get("full_name"):
         return parent["full_name"]
     return fork_full_name
-
-
-def fetch_open_issues(
-    session: requests.Session,
-    repo_full_name: str,
-    include_prs: bool,
-    max_issues: int,
-    connect_timeout_seconds: int,
-    request_timeout_seconds: int,
-    deadline_monotonic: Optional[float],
-) -> List[Dict[str, Any]]:
-    url = (
-        f"https://api.github.com/repos/{repo_full_name}/issues"
-        f"?state=open&per_page={max_issues}&sort=created&direction=desc"
-    )
-    items = gh_get(
-        session,
-        url,
-        connect_timeout_seconds,
-        request_timeout_seconds,
-        deadline_monotonic,
-    )
-    if include_prs:
-        return items
-    return [it for it in items if "pull_request" not in it]
 
 
 def fetch_recent_issues(
@@ -383,6 +518,7 @@ def fetch_recent_issues(
     connect_timeout_seconds: int,
     request_timeout_seconds: int,
     deadline_monotonic: Optional[float],
+    rate_limit_guard: Optional[RateLimitGuard] = None,
 ) -> List[Dict[str, Any]]:
     recent: List[Dict[str, Any]] = []
     for page in range(1, max_pages + 1):
@@ -398,6 +534,7 @@ def fetch_recent_issues(
             connect_timeout_seconds,
             request_timeout_seconds,
             deadline_monotonic,
+            rate_limit_guard,
         )
         if not items:
             break
@@ -418,14 +555,101 @@ def fetch_recent_issues(
     return recent
 
 
+def process_fork_repo(
+    fork_repo: Dict[str, Any],
+    session_factory: Callable[[], requests.Session],
+    rate_limit_guard: RateLimitGuard,
+    include_prs: bool,
+    results_per_page: int,
+    max_pages_per_repo: int,
+    cutoff_epoch: int,
+    use_parent_issues: bool,
+    connect_timeout_seconds: int,
+    request_timeout_seconds: int,
+    deadline_monotonic: Optional[float],
+    last_seen: Dict[str, int],
+) -> Tuple[List[Dict[str, Any]], int, int, str, int, Optional[str]]:
+    fork_full_name = fork_repo.get("full_name")
+    if not fork_full_name:
+        return [], 0, 0, "", 0, None
+
+    session = session_factory()
+    issue_repo = resolve_issue_repo_from_fork(
+        fork_repo, fork_full_name, use_parent_issues
+    )
+    if use_parent_issues and issue_repo == fork_full_name:
+        parent = fork_repo.get("parent") or fork_repo.get("source")
+        if not (parent and parent.get("full_name")):
+            issue_repo = resolve_issue_repo(
+                session,
+                fork_full_name,
+                use_parent_issues,
+                connect_timeout_seconds,
+                request_timeout_seconds,
+                deadline_monotonic,
+                rate_limit_guard,
+            )
+
+    issues = fetch_recent_issues(
+        session,
+        issue_repo,
+        include_prs,
+        results_per_page,
+        max_pages_per_repo,
+        cutoff_epoch,
+        connect_timeout_seconds,
+        request_timeout_seconds,
+        deadline_monotonic,
+        rate_limit_guard,
+    )
+
+    repo_items: List[Dict[str, Any]] = []
+    newest_epoch = 0
+    repo_recent = 0
+    repo_new = 0
+    last_seen_epoch = int(last_seen.get(issue_repo, 0) or 0)
+    for it in issues:
+        created_at = it.get("created_at", "")
+        created_epoch = iso_to_epoch(created_at)
+        if created_epoch > newest_epoch:
+            newest_epoch = created_epoch
+        if created_epoch >= cutoff_epoch:
+            repo_recent += 1
+            is_new = last_seen_epoch > 0 and created_epoch > last_seen_epoch
+            if is_new:
+                repo_new += 1
+            labels = [
+                {"name": lb.get("name", ""), "color": lb.get("color", "ededed")}
+                for lb in it.get("labels", [])
+            ]
+            repo_items.append(
+                {
+                    "repo": issue_repo,
+                    "source_repo": fork_full_name,
+                    "number": it.get("number"),
+                    "title": it.get("title"),
+                    "url": it.get("html_url"),
+                    "created_at": created_at,
+                    "labels": labels,
+                    "is_new": is_new,
+                }
+            )
+
+    return repo_items, repo_recent, repo_new, issue_repo, newest_epoch, None
+
+
 def main() -> None:
+    load_dotenv(DOTENV_PATH)
     cfg = load_json(CONFIG_PATH, DEFAULT_CONFIG)
     state = load_json(STATE_PATH, {"last_seen": {}})
+    last_seen_snapshot: Dict[str, int] = {
+        str(repo): int(epoch or 0) for repo, epoch in state.get("last_seen", {}).items()
+    }
 
-    token = os.getenv("GITHUB_TOKEN") or cfg.get("github_token") or None
+    token = resolve_github_token(cfg)
+    authenticated = token is not None
     username = os.getenv("GITHUB_USERNAME") or cfg.get("github_username") or ""
     include_prs = bool(cfg.get("include_prs", False))
-    max_issues = int(cfg.get("max_issues_per_repo", 10))
     max_repos = int(cfg.get("max_repos", 50))
     days_back = int(cfg.get("days_back", 7))
     results_per_page = int(cfg.get("results_per_page", 100))
@@ -436,12 +660,27 @@ def main() -> None:
     request_retries = int(cfg.get("request_retries", 3))
     retry_backoff_seconds = float(cfg.get("retry_backoff_seconds", 0.5))
     max_runtime_seconds = int(cfg.get("max_runtime_seconds", 50))
+    max_concurrent_repos = effective_concurrency(
+        int(cfg.get("max_concurrent_repos", 8)), authenticated
+    )
     deadline_monotonic = (
         time.monotonic() + max_runtime_seconds if max_runtime_seconds > 0 else None
     )
     now_epoch = int(time.time())
     cutoff_epoch = now_epoch - (days_back * 24 * 60 * 60)
-    session = build_github_session(token, request_retries, retry_backoff_seconds)
+    rate_limit_guard = RateLimitGuard(threshold=rate_limit_threshold(authenticated))
+    session = build_github_session(
+        token,
+        request_retries,
+        retry_backoff_seconds,
+        pool_size=max_concurrent_repos,
+    )
+    session_factory = make_thread_local_session_factory(
+        token,
+        request_retries,
+        retry_backoff_seconds,
+        pool_size=max_concurrent_repos,
+    )
 
     try:
         if not username or username in ("your_github_username", "${GITHUB_USERNAME}"):
@@ -457,6 +696,7 @@ def main() -> None:
                 connect_timeout_seconds,
                 request_timeout_seconds,
                 deadline_monotonic,
+                rate_limit_guard,
             )
         except Exception as exc:
             output = {
@@ -470,95 +710,100 @@ def main() -> None:
 
         new_items: List[Dict[str, Any]] = []
         total_recent = 0
+        total_new = 0
         per_repo_counts: Dict[str, int] = {}
         processed_repos = 0
         partial = False
         warning = ""
+        if not authenticated:
+            warning = (
+                "GITHUB_TOKEN is not set; using unauthenticated API limits "
+                f"({UNAUTH_MAX_CONCURRENT_REPOS} concurrent repos max). "
+                "Copy .env.example to .env and add a token."
+            )
+        repo_errors: List[str] = []
 
-        for repo in repos:
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
-                partial = True
-                warning = (
-                    f"Runtime budget reached after processing {processed_repos} repos; "
-                    "results are partial."
-                )
-                break
-            fork_full_name = repo.get("full_name")
-            if not fork_full_name:
-                continue
-            try:
-                issue_repo = resolve_issue_repo(
-                    session,
-                    fork_full_name,
-                    use_parent_issues,
-                    connect_timeout_seconds,
-                    request_timeout_seconds,
-                    deadline_monotonic,
-                )
-                issues = fetch_recent_issues(
-                    session,
-                    issue_repo,
-                    include_prs,
-                    results_per_page,
-                    max_pages_per_repo,
-                    cutoff_epoch,
-                    connect_timeout_seconds,
-                    request_timeout_seconds,
-                    deadline_monotonic,
-                )
-            except TimeoutError:
-                partial = True
-                warning = (
-                    f"Runtime budget reached after processing {processed_repos} repos; "
-                    "results are partial."
-                )
-                break
-            except Exception as exc:
-                output = {
-                    "total_new": 0,
-                    "items": [],
-                    "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                    "error": str(exc),
-                }
-                print(json.dumps(output, indent=2))
-                return
-
-            newest_epoch = 0
-            repo_recent = 0
-            for it in issues:
-                created_at = it.get("created_at", "")
-                created_epoch = iso_to_epoch(created_at)
-                if created_epoch > newest_epoch:
-                    newest_epoch = created_epoch
-                if created_epoch >= cutoff_epoch:
-                    repo_recent += 1
-                    total_recent += 1
-                    labels = [
-                        {"name": lb.get("name", ""), "color": lb.get("color", "ededed")}
-                        for lb in it.get("labels", [])
-                    ]
-                    new_items.append(
-                        {
-                            "repo": issue_repo,
-                            "source_repo": fork_full_name,
-                            "number": it.get("number"),
-                            "title": it.get("title"),
-                            "url": it.get("html_url"),
-                            "created_at": created_at,
-                            "labels": labels,
-                        }
+        pending: Dict[Future, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=max_concurrent_repos) as executor:
+            for repo in repos:
+                if (
+                    deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic
+                ):
+                    partial = True
+                    warning = (
+                        f"Runtime budget reached after processing {processed_repos} repos; "
+                        "results are partial."
                     )
+                    break
+                pending[
+                    executor.submit(
+                        process_fork_repo,
+                        repo,
+                        session_factory,
+                        rate_limit_guard,
+                        include_prs,
+                        results_per_page,
+                        max_pages_per_repo,
+                        cutoff_epoch,
+                        use_parent_issues,
+                        connect_timeout_seconds,
+                        request_timeout_seconds,
+                        deadline_monotonic,
+                        last_seen_snapshot,
+                    )
+                ] = repo
 
-            per_repo_counts[issue_repo] = repo_recent
-            state["last_seen"][issue_repo] = newest_epoch
-            processed_repos += 1
+            while pending:
+                done, _ = wait(tuple(pending.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future)
+                    try:
+                        repo_items, repo_recent, repo_new, issue_repo, newest_epoch, _ = (
+                            future.result()
+                        )
+                    except TimeoutError:
+                        partial = True
+                        warning = (
+                            f"Runtime budget reached after processing {processed_repos} repos; "
+                            "results are partial."
+                        )
+                        pending.clear()
+                        break
+                    except Exception as exc:
+                        repo_errors.append(str(exc))
+                        continue
+
+                    if not issue_repo:
+                        continue
+
+                    new_items.extend(repo_items)
+                    total_recent += repo_recent
+                    total_new += repo_new
+                    per_repo_counts[issue_repo] = repo_recent
+                    previous_seen = int(state["last_seen"].get(issue_repo, 0) or 0)
+                    state["last_seen"][issue_repo] = max(previous_seen, newest_epoch)
+                    processed_repos += 1
+
+                if partial:
+                    for future in pending:
+                        future.cancel()
+                    break
+
+        if repo_errors and not warning:
+            warning = f"{len(repo_errors)} repo(s) failed; results may be incomplete."
+        elif repo_errors and warning:
+            warning = (
+                f"{warning} {len(repo_errors)} repo(s) failed; results may be incomplete."
+            )
 
         save_json(STATE_PATH, state)
         write_html_report(HTML_REPORT_PATH, new_items, days_back)
 
         new_items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
-        output = {
+        output: FetchOutput = {
             "total_recent": total_recent,
+            "total_new": total_new,
             "per_repo_counts": per_repo_counts,
             "days_back": days_back,
             "max_display": int(cfg.get("max_display", 200)),
@@ -567,10 +812,13 @@ def main() -> None:
             "processed_repos": processed_repos,
             "fetched_fork_repos": len(repos),
             "partial": partial,
+            "authenticated": authenticated,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
         if warning:
             output["warning"] = warning
+        if repo_errors:
+            output["repo_errors"] = repo_errors[:5]
         print(json.dumps(output, indent=2))
     finally:
         session.close()

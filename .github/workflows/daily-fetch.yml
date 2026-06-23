@@ -1,0 +1,75 @@
+name: Daily issue fetch
+
+on:
+  schedule:
+    # 08:00 UTC daily
+    - cron: "0 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore issue state cache
+        uses: actions/cache@v4
+        with:
+          path: github_issue_state.json
+          key: issue-state-${{ github.repository }}-${{ github.run_id }}
+          restore-keys: |
+            issue-state-${{ github.repository }}-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch GitHub issues
+        env:
+          GITHUB_USERNAME: ${{ secrets.USERNAME }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN }}
+        run: python github_issue_pinger.py > fetch-output.json
+
+      - name: Verify fetch succeeded
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+
+          with open("fetch-output.json", encoding="utf-8") as handle:
+              data = json.load(handle)
+
+          if data.get("error"):
+              print(data["error"], file=sys.stderr)
+              sys.exit(1)
+
+          if not data.get("authenticated"):
+              print(data.get("warning") or "GitHub token missing or invalid.", file=sys.stderr)
+              sys.exit(1)
+
+          print(
+              f"OK: total_recent={data.get('total_recent', 0)} "
+              f"total_new={data.get('total_new', 0)}"
+          )
+          PY
+
+      - name: Upload HTML report
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-issues-report-${{ github.run_number }}
+          path: |
+            github_issues_report.html
+            fetch-output.json
+            github_issue_state.json
+          retention-days: 30
+          if-no-files-found: error
