@@ -85,6 +85,31 @@ python github_issue_pinger.py
 
 The script prints JSON to stdout and writes `github_issues_report.html`.
 
+### Activity tracking checkboxes
+
+The generated HTML report includes local activity checkboxes for each issue:
+
+- `Checked`
+- `Commented`
+- `Made PR`
+
+Start the local tracking server before clicking checkboxes:
+
+```bash
+source .venv/bin/activate
+python github_issue_tracking_server.py
+```
+
+Then generate and open the report in another terminal:
+
+```bash
+source .venv/bin/activate
+python github_issue_pinger.py
+open github_issues_report.html
+```
+
+Checkbox changes are saved to `github_issue_tracking.json`. Regenerating the report reads that file and restores the saved checkbox states. Clicking a checkbox never removes an issue from the report.
+
 ### React frontend only
 
 ```bash

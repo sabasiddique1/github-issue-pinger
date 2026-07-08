@@ -10,6 +10,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from github_issue_tracking import (
+    TRACKING_FIELDS,
+    TRACKING_FIELD_LABELS,
+    get_tracking_api_base,
+    get_tracking_path,
+    issue_key_from_item,
+    load_tracking,
+)
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.getenv(
@@ -21,6 +30,7 @@ STATE_PATH = os.getenv(
 HTML_REPORT_PATH = os.getenv(
     "GITHUB_ISSUE_HTML", os.path.join(BASE_DIR, "github_issues_report.html")
 )
+TRACKING_PATH = get_tracking_path()
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "github_username": "${GITHUB_USERNAME}",
@@ -137,24 +147,99 @@ def _format_date(iso_str: str) -> str:
         return iso_str[:10]
 
 
-def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) -> None:
+def _escape_html(text: Any) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _repo_from_github_url(url: str) -> str:
+    prefix = "https://github.com/"
+    if not url.startswith(prefix):
+        return ""
+    parts = url[len(prefix):].split("/")
+    if len(parts) < 4:
+        return ""
+    return f"{parts[0]}/{parts[1]}"
+
+
+def _associated_pr_links(item: Dict[str, Any]) -> str:
+    associated_prs = item.get("associated_prs", [])
+    if not associated_prs:
+        return '<span class="label-empty">—</span>'
+
+    links = []
+    for pr in associated_prs:
+        pr_repo = _escape_html(pr.get("repo", ""))
+        pr_number = pr.get("number", "")
+        pr_title = _escape_html(pr.get("title", ""))
+        pr_url = _escape_html(pr.get("url", ""))
+        pr_label = f"{pr_repo}#{pr_number}" if pr_repo and pr_number else pr_title or "PR"
+        tooltip = f' title="{pr_title}"' if pr_title else ""
+        links.append(
+            f'<a class="pr-link" href="{pr_url}" target="_blank"{tooltip}>{pr_label}</a>'
+        )
+    return "<br />".join(links)
+
+
+def _tracking_cells(item: Dict[str, Any], tracking: Dict[str, Any]) -> str:
+    issue_key = issue_key_from_item(item)
+    entry = tracking.get("issues", {}).get(issue_key, {})
+    cells = []
+
+    for field in TRACKING_FIELDS:
+        checked = " checked" if entry.get(field) else ""
+        label = TRACKING_FIELD_LABELS[field]
+        cells.append(
+            '<td class="track-cell">'
+            '<label class="track-check">'
+            f'<input type="checkbox" data-track-checkbox data-field="{field}"{checked} '
+            f'aria-label="{_escape_html(label)} for {_escape_html(issue_key)}" />'
+            '<span aria-hidden="true"></span>'
+            "</label>"
+            "</td>"
+        )
+
+    return "".join(cells)
+
+
+def write_html_report(
+    path: str,
+    items: List[Dict[str, Any]],
+    days_back: int,
+    tracking: Optional[Dict[str, Any]] = None,
+) -> None:
+    tracking = tracking or {"issues": {}}
+    tracking_api_base = get_tracking_api_base()
     rows = []
     for item in items:
-        title = item.get("title", "").replace("<", "&lt;").replace(">", "&gt;")
-        repo = item.get("repo", "").replace("<", "&lt;").replace(">", "&gt;")
+        title = _escape_html(item.get("title", ""))
+        repo = _escape_html(item.get("repo", ""))
         created = item.get("created_at", "")
-        url = item.get("url", "")
+        url = _escape_html(item.get("url", ""))
+        number = _escape_html(item.get("number", ""))
+        issue_key = _escape_html(issue_key_from_item(item))
         labels = item.get("labels", [])
         date_str = _format_date(created)
         repo_short = repo.split("/")[-1] if "/" in repo else repo
+        tracking_entry = tracking.get("issues", {}).get(issue_key_from_item(item), {})
+        row_class = "has-activity" if any(tracking_entry.get(f) for f in TRACKING_FIELDS) else ""
         label_spans = "".join(
-            f'<span class="label" style="background:#{lb.get("color","ededed")};color:{_label_text_color(lb.get("color","ededed"))}">{lb.get("name","")}</span>'
+            f'<span class="label" style="background:#{lb.get("color","ededed")};color:{_label_text_color(lb.get("color","ededed"))}">{_escape_html(lb.get("name",""))}</span>'
             for lb in labels
         ) or '<span class="label-empty">—</span>'
         rows.append(
-            f'<tr><td class="date">{date_str}</td>'
+            f'<tr class="{row_class}" data-issue-key="{issue_key}" data-repo="{repo}" '
+            f'data-number="{number}" data-title="{title}" data-url="{url}">'
+            f'{_tracking_cells(item, tracking)}'
+            f'<td class="date">{date_str}</td>'
             f'<td class="repo"><a href="https://github.com/{repo}" target="_blank">{repo_short}</a></td>'
             f'<td class="title"><a href="{url}" target="_blank">{title}</a></td>'
+            f'<td class="associated-prs">{_associated_pr_links(item)}</td>'
             f'<td class="labels">{label_spans}</td></tr>'
         )
 
@@ -174,14 +259,33 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
       color: #e6edf3;
       min-height: 100vh;
     }}
-    .container {{ max-width: 960px; margin: 0 auto; }}
+    .container {{ max-width: 1320px; margin: 0 auto; }}
     h1 {{
       font-size: 1.5rem;
       font-weight: 600;
       margin: 0 0 20px;
       color: #f0f6fc;
     }}
-    .meta {{ color: #8b949e; font-size: 0.9rem; margin-bottom: 20px; }}
+    .meta {{
+      align-items: center;
+      color: #8b949e;
+      display: flex;
+      flex-wrap: wrap;
+      font-size: 0.9rem;
+      gap: 12px;
+      margin-bottom: 20px;
+    }}
+    .tracking-status {{
+      border: 1px solid #30363d;
+      border-radius: 999px;
+      color: #8b949e;
+      font-size: 0.78rem;
+      line-height: 1;
+      padding: 5px 8px;
+    }}
+    .tracking-status[data-state="online"] {{ border-color: #238636; color: #7ee787; }}
+    .tracking-status[data-state="offline"] {{ border-color: #8b5e34; color: #d29922; }}
+    .tracking-status[data-state="error"] {{ border-color: #da3633; color: #ff7b72; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 12px 16px; text-align: left; border-bottom: 1px solid #21262d; }}
     th {{
@@ -196,6 +300,59 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
       z-index: 1;
     }}
     tr:hover {{ background: #161b22; }}
+    tr.has-activity {{ background: rgba(35, 134, 54, 0.07); }}
+    tr.has-activity:hover {{ background: rgba(35, 134, 54, 0.12); }}
+    .track-cell {{
+      padding-left: 8px;
+      padding-right: 8px;
+      text-align: center;
+      width: 52px;
+    }}
+    .track-check {{
+      align-items: center;
+      cursor: pointer;
+      display: inline-flex;
+      height: 22px;
+      justify-content: center;
+      width: 22px;
+    }}
+    .track-check input {{
+      opacity: 0;
+      position: absolute;
+    }}
+    .track-check span {{
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 5px;
+      display: block;
+      height: 18px;
+      position: relative;
+      transition: border-color 120ms ease, background 120ms ease;
+      width: 18px;
+    }}
+    .track-check input:focus-visible + span {{
+      box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.28);
+      outline: none;
+    }}
+    .track-check input:checked + span {{
+      background: #238636;
+      border-color: #2ea043;
+    }}
+    .track-check input:checked + span::after {{
+      border: solid #ffffff;
+      border-width: 0 2px 2px 0;
+      content: "";
+      height: 9px;
+      left: 6px;
+      position: absolute;
+      top: 2px;
+      transform: rotate(45deg);
+      width: 4px;
+    }}
+    .track-check input:disabled + span {{
+      cursor: wait;
+      opacity: 0.6;
+    }}
     .date {{ white-space: nowrap; color: #8b949e; font-size: 0.85rem; width: 90px; }}
     .repo {{ width: 140px; }}
     .repo a {{
@@ -211,6 +368,13 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
       line-height: 1.4;
     }}
     .title a:hover {{ color: #58a6ff; text-decoration: underline; }}
+    .associated-prs {{ width: 220px; font-size: 0.85rem; }}
+    .pr-link {{
+      color: #79c0ff;
+      text-decoration: none;
+      line-height: 1.5;
+    }}
+    .pr-link:hover {{ text-decoration: underline; }}
     .labels {{ max-width: 180px; }}
     .label {{
       display: inline-block;
@@ -227,13 +391,20 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
 <body>
   <div class="container">
     <h1>GitHub Issues (last {days_back} days)</h1>
-    <p class="meta">{len(items)} issues from your forked repos</p>
+    <p class="meta">
+      <span>{len(items)} issues from your forked repos</span>
+      <span class="tracking-status" data-tracking-status data-state="checking">Tracking: checking</span>
+    </p>
     <table>
       <thead>
         <tr>
+          <th>Checked</th>
+          <th>Commented</th>
+          <th>Made PR</th>
           <th>Date</th>
           <th>Repo</th>
           <th>Title</th>
+          <th>Associated PRs</th>
           <th>Labels</th>
         </tr>
       </thead>
@@ -242,6 +413,103 @@ def write_html_report(path: str, items: List[Dict[str, Any]], days_back: int) ->
       </tbody>
     </table>
   </div>
+  <script>
+    (() => {{
+      const apiBase = {json.dumps(tracking_api_base)};
+      const trackingUrl = `${{apiBase}}/tracking`;
+      const trackUrl = `${{apiBase}}/track`;
+      const status = document.querySelector("[data-tracking-status]");
+      const fields = {json.dumps(list(TRACKING_FIELDS))};
+
+      function setStatus(state, text) {{
+        if (!status) return;
+        status.dataset.state = state;
+        status.textContent = text;
+      }}
+
+      function setRowState(row) {{
+        const hasActivity = fields.some((field) => {{
+          const input = row.querySelector(`[data-track-checkbox][data-field="${{field}}"]`);
+          return input && input.checked;
+        }});
+        row.classList.toggle("has-activity", hasActivity);
+      }}
+
+      async function loadTrackingState() {{
+        try {{
+          const response = await fetch(trackingUrl, {{ cache: "no-store" }});
+          if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+          const tracking = await response.json();
+          const issues = tracking.issues || {{}};
+
+          document.querySelectorAll("tr[data-issue-key]").forEach((row) => {{
+            const entry = issues[row.dataset.issueKey] || {{}};
+            fields.forEach((field) => {{
+              const input = row.querySelector(`[data-track-checkbox][data-field="${{field}}"]`);
+              if (!input || input.disabled) return;
+              const checked = Boolean(entry[field]);
+              input.checked = checked;
+              input.dataset.previousChecked = String(checked);
+            }});
+            setRowState(row);
+          }});
+
+          setStatus("online", "Tracking: loaded");
+        }} catch (error) {{
+          setStatus("offline", "Tracking: server offline");
+        }}
+      }}
+
+      async function saveCheckbox(input) {{
+        const row = input.closest("tr[data-issue-key]");
+        if (!row) return;
+
+        const previous = input.dataset.previousChecked === "true";
+        const next = input.checked;
+        input.disabled = true;
+        setStatus("checking", "Tracking: saving");
+
+        const payload = {{
+          issue_key: row.dataset.issueKey,
+          repo: row.dataset.repo,
+          number: row.dataset.number,
+          title: row.dataset.title,
+          url: row.dataset.url,
+          field: input.dataset.field,
+          value: next,
+        }};
+
+        try {{
+          const response = await fetch(trackUrl, {{
+            method: "POST",
+            headers: {{ "Content-Type": "application/json" }},
+            body: JSON.stringify(payload),
+          }});
+          if (!response.ok) {{
+            const details = await response.json().catch(() => ({{}}));
+            throw new Error(details.error || `HTTP ${{response.status}}`);
+          }}
+          input.dataset.previousChecked = String(next);
+          setRowState(row);
+          setStatus("online", "Tracking: saved");
+        }} catch (error) {{
+          input.checked = previous;
+          setRowState(row);
+          setStatus("error", "Tracking: save failed");
+        }} finally {{
+          input.disabled = false;
+        }}
+      }}
+
+      document.querySelectorAll("[data-track-checkbox]").forEach((input) => {{
+        input.dataset.previousChecked = String(input.checked);
+        setRowState(input.closest("tr[data-issue-key]"));
+        input.addEventListener("change", () => saveCheckbox(input));
+      }});
+
+      loadTrackingState();
+    }})();
+  </script>
 </body>
 </html>"""
 
@@ -418,6 +686,88 @@ def fetch_recent_issues(
     return recent
 
 
+def fetch_associated_prs(
+    session: requests.Session,
+    repo_full_name: str,
+    issue_number: int,
+    connect_timeout_seconds: int,
+    request_timeout_seconds: int,
+    deadline_monotonic: Optional[float],
+) -> List[Dict[str, Any]]:
+    url = (
+        f"https://api.github.com/repos/{repo_full_name}/issues/{issue_number}/timeline"
+        "?per_page=100"
+    )
+    events = gh_get(
+        session,
+        url,
+        connect_timeout_seconds,
+        request_timeout_seconds,
+        deadline_monotonic,
+    )
+    associated_prs: List[Dict[str, Any]] = []
+    seen = set()
+
+    for event in events:
+        source = event.get("source") or {}
+        source_issue = source.get("issue") or {}
+        if not source_issue.get("pull_request"):
+            continue
+
+        pr_number = source_issue.get("number")
+        pr_url = source_issue.get("html_url") or ""
+        pr_repo = _repo_from_github_url(pr_url) or repo_full_name
+        if not pr_number or not pr_url:
+            continue
+
+        key = (pr_repo, pr_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        associated_prs.append(
+            {
+                "repo": pr_repo,
+                "number": pr_number,
+                "title": source_issue.get("title", ""),
+                "url": pr_url,
+            }
+        )
+
+    return associated_prs
+
+
+def enrich_associated_prs(
+    session: requests.Session,
+    items: List[Dict[str, Any]],
+    connect_timeout_seconds: int,
+    request_timeout_seconds: int,
+    deadline_monotonic: Optional[float],
+) -> bool:
+    skipped_due_to_budget = False
+
+    for item in items:
+        item["associated_prs"] = []
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            skipped_due_to_budget = True
+            continue
+
+        try:
+            item["associated_prs"] = fetch_associated_prs(
+                session,
+                item.get("repo", ""),
+                int(item.get("number", 0)),
+                connect_timeout_seconds,
+                request_timeout_seconds,
+                deadline_monotonic,
+            )
+        except TimeoutError:
+            skipped_due_to_budget = True
+        except Exception:
+            item["associated_prs"] = []
+
+    return skipped_due_to_budget
+
+
 def main() -> None:
     cfg = load_json(CONFIG_PATH, DEFAULT_CONFIG)
     state = load_json(STATE_PATH, {"last_seen": {}})
@@ -553,22 +903,35 @@ def main() -> None:
             state["last_seen"][issue_repo] = newest_epoch
             processed_repos += 1
 
-        save_json(STATE_PATH, state)
-        write_html_report(HTML_REPORT_PATH, new_items, days_back)
-
         new_items.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        skipped_associated_pr_lookup = enrich_associated_prs(
+            session,
+            new_items,
+            connect_timeout_seconds,
+            request_timeout_seconds,
+            deadline_monotonic,
+        )
+        tracking = load_tracking(TRACKING_PATH)
+
+        save_json(STATE_PATH, state)
+        write_html_report(HTML_REPORT_PATH, new_items, days_back, tracking)
+
         output = {
             "total_recent": total_recent,
             "per_repo_counts": per_repo_counts,
             "days_back": days_back,
             "max_display": int(cfg.get("max_display", 200)),
             "html_report_path": HTML_REPORT_PATH,
+            "tracking_path": TRACKING_PATH,
             "items": new_items,
             "processed_repos": processed_repos,
             "fetched_fork_repos": len(repos),
             "partial": partial,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        if skipped_associated_pr_lookup:
+            pr_warning = "Associated PR lookup was skipped for some issues due to runtime budget."
+            warning = f"{warning} {pr_warning}".strip() if warning else pr_warning
         if warning:
             output["warning"] = warning
         print(json.dumps(output, indent=2))

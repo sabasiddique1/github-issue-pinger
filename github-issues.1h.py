@@ -19,6 +19,10 @@ BASE = next((b for b in _base_candidates if os.path.isfile(os.path.join(b, "gith
 _venv_python = os.path.join(BASE, ".venv/bin/python3")
 PYTHON = os.environ.get("PYTHON_BIN") or (_venv_python if os.path.isfile(_venv_python) else "python3")
 SCRIPT = os.path.join(BASE, "github_issue_pinger.py")
+TRACKING_SERVER = os.path.join(BASE, "github_issue_tracking_server.py")
+TRACKING_FILE = os.environ.get(
+    "GITHUB_ISSUE_TRACKING", os.path.join(BASE, "github_issue_tracking.json")
+)
 SUBPROCESS_TIMEOUT_SECONDS = 75
 
 try:
@@ -59,6 +63,9 @@ report_path = os.path.abspath(os.path.expanduser(report_path))
 print(f"🪼 OSS Issues: {total} (last {days_back}d) | refresh=true")
 print("---")
 print(f"Open full list (browser) | bash=/usr/bin/open param1={report_path} terminal=false")
+if os.path.isfile(TRACKING_SERVER):
+    print(f"Start activity tracker | bash={PYTHON} param1={TRACKING_SERVER} terminal=true")
+print(f"Open tracking file | open={TRACKING_FILE}")
 print("---")
 if data.get("error"):
     print(f"Error: {data['error']}")
@@ -105,3 +112,4 @@ print("Open plugin folder | open=/Users/saba/Library/Application Support/SwiftBa
 
 # // killall SwiftBar && open -a SwiftBar
 # // killall SwiftBar
+# cd /Users/saba/Desktop/my_Gems/github-issue-pinger && tmp=$(mktemp) && python3 -c 'import json,sys; d=json.load(open("github_issue_config.json")); d["request_timeout_seconds"]=30; d["max_runtime_seconds"]=180; json.dump(d, open(sys.argv[1],"w"))' "$tmp" && GITHUB_ISSUE_CONFIG="$tmp" ./.venv/bin/python3 github_issue_pinger.py && open github_issues_report.html && open "swiftbar://refresh" && rm "$tmp"
