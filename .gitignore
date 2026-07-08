@@ -8,4 +8,5 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 github_issue_state.json
+github_issue_tracking.json
 github_issues_report.html
